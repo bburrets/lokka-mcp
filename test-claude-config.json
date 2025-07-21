@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "Lokka-Test": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "--env-file",
+        "/Users/bburrets/Code/lokka-mcp/.env",
+        "lokka-mcp:latest"
+      ]
+    }
+  }
+}

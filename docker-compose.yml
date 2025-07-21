@@ -1,0 +1,104 @@
+services:
+  lokka:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lokka-mcp-server
+    restart: "no"
+    stdin_open: true
+    tty: true
+    environment:
+      # Microsoft Entra App Configuration
+      TENANT_ID: ${TENANT_ID}
+      CLIENT_ID: ${CLIENT_ID}
+      CLIENT_SECRET: ${CLIENT_SECRET}
+      
+      # Optional: Interactive Authentication Mode
+      # USE_INTERACTIVE: "true"
+      # REDIRECT_URI: "http://localhost:3000"
+      
+      # Optional: Client Token Mode
+      # USE_CLIENT_TOKEN: "true"
+      # ACCESS_TOKEN: ${ACCESS_TOKEN}
+      
+      # Optional: Graph API Version
+      # GRAPH_API_VERSION: "v1.0"  # or "beta"
+      
+      # Node.js Configuration
+      NODE_ENV: production
+      
+    # Port mapping - adjust based on your MCP client requirements
+    ports:
+      - "3000:3000"
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Security options
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/tmp
+
+  # Optional: Redis cache for enhanced performance
+  redis:
+    image: redis:7-alpine
+    container_name: lokka-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-changeme}
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+  # Optional: PostgreSQL for audit logging
+  postgres:
+    image: postgres:16-alpine
+    container_name: lokka-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: lokka
+      POSTGRES_USER: lokka
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+
+volumes:
+  redis-data:
+  postgres-data:
