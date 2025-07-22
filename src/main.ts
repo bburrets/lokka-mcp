@@ -7,6 +7,7 @@ import fetch from 'isomorphic-fetch'; // Required polyfill for Graph client
 import { logger } from "./logger.js";
 import { AuthManager, AuthConfig, AuthMode } from "./auth.js";
 import { LokkaClientId, LokkaDefaultTenantId, LokkaDefaultRedirectUri, getDefaultGraphApiVersion } from "./constants.js";
+import { getSharePointFormDigest, buildSharePointUrl } from "./sharepoint-helpers.js";
 
 // Set up global fetch for the Microsoft Graph client
 (global as any).fetch = fetch;
@@ -33,7 +34,7 @@ server.tool(
   "Lokka-Microsoft",
   "A versatile tool to interact with Microsoft APIs including Microsoft Graph (Entra) and Azure Resource Management. IMPORTANT: For Graph API GET requests using advanced query parameters ($filter, $count, $search, $orderby), you are ADVISED to set 'consistencyLevel: \"eventual\"'.",
   {
-    apiType: z.enum(["graph", "azure"]).describe("Type of Microsoft API to query. Options: 'graph' for Microsoft Graph (Entra) or 'azure' for Azure Resource Management."),
+    apiType: z.enum(["graph", "azure", "sharepoint"]).describe("Type of Microsoft API to query. Options: 'graph' for Microsoft Graph (Entra), 'azure' for Azure Resource Management, or 'sharepoint' for SharePoint REST API."),
     path: z.string().describe("The Azure or Graph API URL path to call (e.g. '/users', '/groups', '/subscriptions')"),
     method: z.enum(["get", "post", "put", "patch", "delete"]).describe("HTTP method to use"),
     apiVersion: z.string().optional().describe("Azure Resource Management API version (required for apiType Azure)"),
@@ -43,6 +44,8 @@ server.tool(
     graphApiVersion: z.enum(["v1.0", "beta"]).optional().default(defaultGraphApiVersion as "v1.0" | "beta").describe(`Microsoft Graph API version to use (default: ${defaultGraphApiVersion})`),
     fetchAll: z.boolean().optional().default(false).describe("Set to true to automatically fetch all pages for list results (e.g., users, groups). Default is false."),
     consistencyLevel: z.string().optional().describe("Graph API ConsistencyLevel header. ADVISED to be set to 'eventual' for Graph GET requests using advanced query parameters ($filter, $count, $search, $orderby)."),
+    siteUrl: z.string().optional().describe("SharePoint site URL (required for apiType='sharepoint', e.g., 'https://tenant.sharepoint.com/sites/sitename')"),
+    useFormDigest: z.boolean().optional().default(true).describe("Whether to use form digest for SharePoint REST API calls (default: true)"),
   },
   async ({
     apiType,
@@ -54,9 +57,11 @@ server.tool(
     body,
     graphApiVersion,
     fetchAll,
-    consistencyLevel
+    consistencyLevel,
+    siteUrl,
+    useFormDigest
   }: {
-    apiType: "graph" | "azure";
+    apiType: "graph" | "azure" | "sharepoint";
     path: string;
     method: "get" | "post" | "put" | "patch" | "delete";
     apiVersion?: string;
@@ -66,6 +71,8 @@ server.tool(
     graphApiVersion: "v1.0" | "beta";
     fetchAll: boolean;
     consistencyLevel?: string;
+    siteUrl?: string;
+    useFormDigest: boolean;
   }) => {
     // Override graphApiVersion if USE_GRAPH_BETA is explicitly set to false
     const effectiveGraphApiVersion = !useGraphBeta ? "v1.0" : graphApiVersion;
@@ -151,7 +158,7 @@ server.tool(
             throw new Error(`Unsupported method: ${method}`);
         }
       }      // --- Azure Resource Management Logic (using direct fetch) ---
-      else { // apiType === 'azure'
+      else if (apiType === 'azure') {
         if (!authManager) {
           throw new Error("Auth manager not initialized");
         }
@@ -255,9 +262,164 @@ server.tool(
         }
       }
 
+      // --- SharePoint REST API Logic ---
+      else { // apiType === 'sharepoint'
+        if (!authManager) {
+          throw new Error("Auth manager not initialized");
+        }
+        
+        if (!siteUrl) {
+          throw new Error("siteUrl is required for SharePoint REST API calls");
+        }
+        
+        determinedUrl = siteUrl; // For error reporting
+        
+        // Get token for SharePoint
+        let token: string;
+        if (authManager.getAuthMode() === AuthMode.ClientProvidedToken) {
+          // For client-provided tokens, use the Graph token directly
+          const graphCredential = authManager.getGraphAuthProvider();
+          const tokenResponse = await graphCredential.getAccessToken();
+          if (!tokenResponse) {
+            throw new Error("Failed to acquire access token for SharePoint");
+          }
+          token = tokenResponse;
+        } else {
+          // For other modes, get a SharePoint-specific token
+          const credential = authManager.getAzureCredential();
+          const sharepointResource = new URL(siteUrl).origin + "/.default";
+          const tokenResponse = await credential.getToken(sharepointResource);
+          if (!tokenResponse || !tokenResponse.token) {
+            throw new Error("Failed to acquire SharePoint access token");
+          }
+          token = tokenResponse.token;
+        }
+        
+        // Build the full URL
+        const fullUrl = buildSharePointUrl(siteUrl, path);
+        logger.info(`SharePoint REST API call to: ${fullUrl}`);
+        
+        // Prepare headers
+        const headers: Record<string, string> = {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/json;odata=verbose'
+        };
+        
+        // Add form digest for write operations if enabled
+        if (useFormDigest && ['post', 'put', 'patch', 'delete'].includes(method.toLowerCase())) {
+          try {
+            const formDigest = await getSharePointFormDigest(siteUrl, token);
+            headers['X-RequestDigest'] = formDigest;
+            logger.info("Added form digest to request headers");
+          } catch (error) {
+            logger.info("Failed to get form digest, proceeding without it:", error);
+          }
+        }
+        
+        // Set appropriate content type based on the operation
+        if (path.includes('/AttachmentFiles/add')) {
+          // Binary content for attachments
+          headers['Content-Type'] = 'application/octet-stream';
+        } else if (body && ['post', 'put', 'patch'].includes(method.toLowerCase())) {
+          headers['Content-Type'] = 'application/json;odata=verbose';
+        }
+        
+        // Add query parameters
+        let finalUrl = fullUrl;
+        if (queryParams && Object.keys(queryParams).length > 0) {
+          const urlParams = new URLSearchParams(queryParams);
+          finalUrl += `?${urlParams.toString()}`;
+        }
+        
+        // Prepare request options
+        const requestOptions: RequestInit = {
+          method: method.toUpperCase(),
+          headers: headers
+        };
+        
+        // Handle body
+        if (['POST', 'PUT', 'PATCH'].includes(method.toUpperCase()) && body) {
+          // Check if body is binary data (for attachments)
+          if (body instanceof Buffer || body instanceof ArrayBuffer) {
+            requestOptions.body = body;
+          } else if (typeof body === 'string' && path.includes('/AttachmentFiles/add')) {
+            // Base64 string for attachments
+            requestOptions.body = Buffer.from(body, 'base64');
+          } else {
+            // JSON data
+            requestOptions.body = JSON.stringify(body);
+          }
+        }
+        
+        // Make the request
+        logger.info(`Making ${method.toUpperCase()} request to SharePoint`);
+        const response = await fetch(finalUrl, requestOptions);
+        const responseText = await response.text();
+        
+        // Parse response
+        try {
+          if (responseText) {
+            responseData = JSON.parse(responseText);
+            // Normalize SharePoint response (remove 'd' wrapper if present)
+            if (responseData.d) {
+              responseData = responseData.d;
+            }
+          } else {
+            // Empty response (common for DELETE)
+            responseData = { status: "Success (No Content)" };
+          }
+        } catch (e) {
+          logger.error(`Failed to parse JSON from SharePoint response:`, responseText);
+          responseData = { rawResponse: responseText };
+        }
+        
+        if (!response.ok) {
+          logger.error(`SharePoint API error for ${method} ${path}:`, responseData);
+          throw new Error(`SharePoint API error (${response.status}): ${JSON.stringify(responseData)}`);
+        }
+        
+        // Handle pagination for SharePoint (if fetchAll is true)
+        if (fetchAll && method === 'get' && responseData.results && Array.isArray(responseData.results)) {
+          logger.info("Detected SharePoint list results, checking for pagination");
+          let allResults = [...responseData.results];
+          let nextUrl = responseData.__next;
+          
+          while (nextUrl) {
+            logger.info(`Fetching next page: ${nextUrl}`);
+            const nextResponse = await fetch(nextUrl, {
+              method: 'GET',
+              headers: {
+                'Authorization': `Bearer ${token}`,
+                'Accept': 'application/json;odata=verbose'
+              }
+            });
+            
+            const nextText = await nextResponse.text();
+            const nextData = JSON.parse(nextText);
+            
+            if (nextData.d?.results) {
+              allResults = allResults.concat(nextData.d.results);
+              nextUrl = nextData.d.__next;
+            } else {
+              break;
+            }
+          }
+          
+          responseData = {
+            results: allResults,
+            __metadata: responseData.__metadata
+          };
+          logger.info(`Finished fetching all SharePoint pages. Total items: ${allResults.length}`);
+        }
+      }
+
       // --- Format and Return Result ---
       // For all requests, format as text
-      let resultText = `Result for ${apiType} API (${apiType === 'graph' ? effectiveGraphApiVersion : apiVersion}) - ${method} ${path}:\n\n`;
+      let resultText = `Result for ${apiType} API (${
+        apiType === 'graph' ? effectiveGraphApiVersion : 
+        apiType === 'sharepoint' ? 'REST' : 
+        apiVersion
+      }) - ${method} ${path}:\n\n`;
       resultText += JSON.stringify(responseData, null, 2); // responseData already contains the correct structure for fetchAll Graph case
 
       // Add pagination note if applicable (only for single page GET)
@@ -278,6 +440,8 @@ server.tool(
       if (!determinedUrl) {
          determinedUrl = apiType === 'graph'
            ? `https://graph.microsoft.com/${effectiveGraphApiVersion}`
+           : apiType === 'sharepoint'
+           ? siteUrl || "https://sharepoint.com"
            : "https://management.azure.com";
       }
       // Include error body if available from Graph SDK error
